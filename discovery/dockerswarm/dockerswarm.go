@@ -44,7 +44,6 @@ type SDConfig struct {
 	HTTPClientConfig config_util.HTTPClientConfig `yaml:",inline"`
 
 	Host string `yaml:"host"`
-	url  *url.URL
 	Role string `yaml:"role"`
 	Port int    `yaml:"port"`
 
@@ -62,11 +61,9 @@ func (c *SDConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	if c.Host == "" {
 		return fmt.Errorf("host missing")
 	}
-	url, err := url.Parse(c.Host)
-	if err != nil {
+	if _, err = url.Parse(c.Host); err != nil {
 		return err
 	}
-	c.url = url
 	switch c.Role {
 	case "services", "nodes", "tasks":
 	case "":
@@ -88,33 +85,41 @@ type Discovery struct {
 
 // NewDiscovery returns a new Discovery which periodically refreshes its targets.
 func NewDiscovery(conf *SDConfig, logger log.Logger) (*Discovery, error) {
+	var err error
+
 	d := &Discovery{
 		port: conf.Port,
 		role: conf.Role,
 	}
 
-	rt, err := config_util.NewRoundTripperFromConfig(conf.HTTPClientConfig, "dockerswarm_sd", false)
+	hostURL, err := url.Parse(conf.Host)
 	if err != nil {
 		return nil, err
 	}
 
-	// This is used in tests. In normal situations, it is set when Unmarshaling.
-	if conf.url == nil {
-		conf.url, err = url.Parse(conf.Host)
+	opts := []client.Opt{
+		client.WithHost(conf.Host),
+		client.WithAPIVersionNegotiation(),
+	}
+
+	// There are other protocols than HTTP supported by the Docker daemon, like
+	// unix, which are not supported by the HTTP client. Passing HTTP client
+	// options to the Docker client makes those non-HTTP requests fail.
+	if hostURL.Scheme == "http" || hostURL.Scheme == "https" {
+		rt, err := config_util.NewRoundTripperFromConfig(conf.HTTPClientConfig, "dockerswarm_sd", false)
 		if err != nil {
 			return nil, err
 		}
+		opts = append(opts,
+			client.WithHTTPClient(&http.Client{
+				Transport: rt,
+				Timeout:   time.Duration(conf.RefreshInterval),
+			}),
+			client.WithScheme(hostURL.Scheme),
+		)
 	}
 
-	d.client, err = client.NewClientWithOpts(
-		client.WithHost(conf.Host),
-		client.WithHTTPClient(&http.Client{
-			Transport: rt,
-			Timeout:   time.Duration(conf.RefreshInterval),
-		}),
-		client.WithScheme(conf.url.Scheme),
-		client.WithAPIVersionNegotiation(),
-	)
+	d.client, err = client.NewClientWithOpts(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("error setting up docker swarm client: %w", err)
 	}
